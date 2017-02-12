@@ -1,0 +1,238 @@
+package qapps.datastore.local.hbase;
+
+import java.util.List;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicLong;
+
+import org.datanucleus.TransactionImpl;
+
+import com.google.appengine.api.datastore.DatastoreApiHelper;
+import com.google.appengine.api.datastore.DeleteContext;
+import com.google.appengine.api.datastore.Entity;
+import com.google.appengine.api.datastore.Key;
+import com.google.appengine.api.datastore.PutContext;
+import com.google.appengine.api.datastore.Transaction;
+import com.google.appengine.api.utils.FutureWrapper;
+import com.google.appengine.repackaged.com.google.io.protocol.ProtocolMessage;
+import com.google.apphosting.api.ApiBasePb;
+import com.google.apphosting.api.ApiProxy.ApiConfig;
+import com.google.apphosting.api.DatastorePb;
+import com.google.apphosting.api.DatastorePb.CommitResponse;
+import com.googlecode.objectify.util.FutureHelper;
+
+final class HBaseTransaction implements Transaction, CurrentTransactionProvider {
+
+	private static AtomicLong count = new AtomicLong(1);
+	private long id = count.getAndDecrement();
+
+	enum TransactionState {
+		BEGUN, COMPLETION_IN_PROGRESS, COMMITTED, ROLLED_BACK, ERROR
+	}
+
+	private final ApiConfig apiConfig;
+
+	private final String app;
+
+	/**
+	 * The {@link Future} associated with the BeginTransaction RPC we sent to
+	 * the datastore server.
+	 */
+	private final Future<DatastorePb.Transaction> future;
+
+	private final TransactionStack txnStack;
+
+	private final DatastoreCallbacks callbacks;
+
+	TransactionState state = TransactionState.BEGUN;
+
+	/**
+	 * A {@link PostOpFuture} implementation that runs both post put and post
+	 * delete callbacks.
+	 */
+	private class PostCommitFuture extends PostOpFuture<Void> {
+		private final List<Entity> putEntities;
+		private final List<Key> deletedKeys;
+
+		private PostCommitFuture(List<Entity> putEntities,
+				List<Key> deletedKeys, Future<Void> delegate) {
+			super(delegate, callbacks);
+			this.putEntities = putEntities;
+			this.deletedKeys = deletedKeys;
+		}
+
+		@Override
+		void executeCallbacks() {
+			PutContext putContext = new PutContext(TransactionImpl.this,
+					putEntities);
+			callbacks.executePostPutCallbacks(putContext);
+			DeleteContext deleteContext = new DeleteContext(
+					TransactionImpl.this, deletedKeys);
+			callbacks.executePostDeleteCallbacks(deleteContext);
+		}
+	}
+
+	HBaseTransaction(ApiConfig apiConfig, String app,
+			Future<DatastorePb.Transaction> future, TransactionStack txnStack,
+			DatastoreCallbacks callbacks) {
+		this.apiConfig = apiConfig;
+		this.app = app;
+		this.future = future;
+		this.txnStack = txnStack;
+		this.callbacks = callbacks;
+	}
+
+	/**
+	 * Provides the unique identifier for the txn. Blocks on the future since
+	 * the handle comes back from the datastore server.
+	 */
+	private long getHandle() {
+		return FutureHelper.quietGet(future).getHandle();
+	}
+
+	<T extends ProtocolMessage<T>> Future<T> makeAsyncCall(String methodName,
+			ProtocolMessage<?> request, T response) {
+		return DatastoreApiHelper.makeAsyncCall(apiConfig, methodName, request,
+				response);
+	}
+
+	private <T extends ProtocolMessage<T>> Future<T> makeAsyncCall(
+			String methodName, T response) {
+		DatastorePb.Transaction txn = new DatastorePb.Transaction();
+		txn.setApp(app);
+		txn.setHandle(getHandle());
+
+		return makeAsyncCall(methodName, txn, response);
+	}
+
+	@Override
+	public void commit() {
+		FutureHelper.quietGet(commitAsync());
+	}
+
+	public Future<Void> commitAsync() {
+		ensureTxnStarted();
+		state = TransactionState.COMPLETION_IN_PROGRESS;
+		try {
+			for (Future<?> f : txnStack.getFutures(this)) {
+				FutureHelper.quietGet(f);
+			}
+			Future<CommitResponse> future = makeAsyncCall("Commit",
+					new CommitResponse());
+			return new PostCommitFuture(txnStack.getPutEntities(this),
+					txnStack.getDeletedKeys(this),
+					new FutureWrapper<CommitResponse, Void>(future) {
+						@Override
+						protected Void wrap(CommitResponse ignore)
+								throws Exception {
+							state = TransactionState.COMMITTED;
+							return null;
+						}
+
+						@Override
+						protected Throwable convertException(Throwable cause) {
+							state = TransactionState.ERROR;
+							return cause;
+						}
+					});
+		} finally {
+			txnStack.remove(this);
+		}
+	}
+
+	@Override
+	public void rollback() {
+		FutureHelper.quietGet(rollbackAsync());
+	}
+
+	public Future<Void> rollbackAsync() {
+		ensureTxnStarted();
+		state = TransactionState.COMPLETION_IN_PROGRESS;
+		try {
+			for (Future<?> f : txnStack.getFutures(this)) {
+				FutureHelper.quietGet(f);
+			}
+			Future<ApiBasePb.VoidProto> future = makeAsyncCall("Rollback",
+					new ApiBasePb.VoidProto());
+			return new FutureWrapper<ApiBasePb.VoidProto, Void>(future) {
+				@Override
+				protected Void wrap(ApiBasePb.VoidProto ignore)
+						throws Exception {
+					state = TransactionState.ROLLED_BACK;
+					return null;
+				}
+
+				@Override
+				protected Throwable convertException(Throwable cause) {
+					state = TransactionState.ERROR;
+					return cause;
+				}
+			};
+		} finally {
+			txnStack.remove(this);
+		}
+	}
+
+	@Override
+	public String getApp() {
+		return app;
+	}
+
+	@Override
+	public String getId() {
+		return Long.toString(getHandle());
+	}
+
+	@Override
+	public boolean equals(Object o) {
+		if (this == o) {
+			return true;
+		}
+		if (o == null || getClass() != o.getClass()) {
+			return false;
+		}
+
+		HBaseTransaction that = (HBaseTransaction) o;
+
+		return getHandle() == ((HBaseTransaction) that).getHandle();
+	}
+
+	@Override
+	public int hashCode() {
+		return (int) (getHandle() ^ (getHandle() >>> 32));
+	}
+
+	@Override
+	public String toString() {
+		return "Txn [" + app + "." + getHandle() + ", " + state + "]";
+	}
+
+	@Override
+	public boolean isActive() {
+		return state == TransactionState.BEGUN
+				|| state == TransactionState.COMPLETION_IN_PROGRESS;
+	}
+
+	@Override
+	public Transaction getCurrentTransaction(Transaction defaultValue) {
+		return this;
+	}
+
+	/**
+	 * If {@code txn} is not null and not active, throw
+	 * {@link IllegalStateException}.
+	 */
+	static void ensureTxnActive(Transaction txn) {
+		if (txn != null && !txn.isActive()) {
+			throw new IllegalStateException(
+					"Transaction with which this operation is "
+							+ "associated is not active.");
+		}
+	}
+
+	private void ensureTxnStarted() {
+		if (state != TransactionState.BEGUN) {
+			throw new IllegalStateException("Transaction is in state " + state
+					+ ".  There is no legal " + "transition out of this state.");
+		}
+	}
+}
